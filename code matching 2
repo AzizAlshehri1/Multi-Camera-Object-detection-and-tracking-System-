@@ -1,0 +1,353 @@
+!pip install ultralytics
+!pip install opencv-python
+!pip install cvzone
+!pip install deep_sort_realtime
+!pip install torch
+
+///////////
+
+import numpy as np
+from ultralytics import YOLO
+import cv2
+import cvzone
+from deep_sort_realtime.deepsort_tracker import DeepSort
+
+# Initialize video capture and YOLO model
+model = YOLO("yolov10x.pt")
+
+# Define paths to video files
+source_video1 = "/content/VideoTracking1.mp4"
+source_video2 = "/content/VideoTracking11.mp4"
+
+# Open the video files
+cap1 = cv2.VideoCapture(source_video1)
+cap2 = cv2.VideoCapture(source_video2)
+
+# Check if videos opened correctly
+if not cap1.isOpened() or not cap2.isOpened():
+    print("Error: Could not open one or both video files.")
+    cap1.release()
+    cap2.release()
+
+# Get video properties for video 1
+fps1 = cap1.get(cv2.CAP_PROP_FPS)
+width1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
+height1 = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# Get video properties for video 2
+fps2 = cap2.get(cv2.CAP_PROP_FPS)
+width2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
+height2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# Initialize DeepSORT tracker with customized parameters
+tracker = DeepSort(
+    max_age=60,
+    n_init=6,
+    max_iou_distance=0.2,
+    max_cosine_distance=0.25,
+    nn_budget=100
+)
+
+# Define codecs and create VideoWriter objects to save the output videos
+output_path1 = "/content/output_video1_with_tracking.mp4"
+output_path2 = "/content/output_video2_with_tracking.mp4"
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out1 = cv2.VideoWriter(output_path1, fourcc, fps1, (width1, height1))
+out2 = cv2.VideoWriter(output_path2, fourcc, fps2, (width2, height2))
+
+# Store embeddings and track IDs for objects in video 1
+embeddings_video1 = {}
+
+# Store matched IDs between video1 and video2
+matched_ids_video2 = {}
+
+# Process Video1
+while True:
+    success, img = cap1.read()
+    if not success:
+        break
+
+    # Get YOLO detections
+    results = model(img, stream=True)
+    detections = []
+
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
+            w, h = x2 - x1, y2 - y1
+
+            # Confidence and class filtering
+            conf = box.conf[0]
+            cls = int(box.cls[0])
+            currentClass = "car" if cls == 2 else ""  # Assumes "car" is the 3rd class in classNames
+
+            # Filter to consider only "car" class
+            if currentClass == "car" and conf > 0.3:
+                detections.append(([x1, y1, w, h], conf, cls))
+
+    # Update DeepSORT tracker with detections
+    tracks = tracker.update_tracks(detections, frame=img)
+
+    for track in tracks:
+        if not track.is_confirmed():
+            continue
+
+        # Store track embedding for matching later
+        track_id = track.track_id
+        embedding = np.array(track.features).reshape(-1)  # DeepSORT appearance embedding, reshaped
+        embeddings_video1[track_id] = embedding
+
+        # Draw bounding box and ID
+        ltrb = track.to_ltrb()
+        x1, y1, x2, y2 = map(int, ltrb)
+        w, h = x2 - x1, y2 - y1
+        cvzone.cornerRect(img, (x1, y1, w, h), l=9, rt=2, colorR=(255, 0, 255))
+        cvzone.putTextRect(img, f'ID {track_id}', (max(0, x1), max(35, y1)), scale=0.7, thickness=1, offset=3)
+
+    out1.write(img)
+
+# Process Video2 and match objects with Video1 embeddings
+while True:
+    success, img = cap2.read()
+    if not success:
+        break
+
+    # Get YOLO detections
+    results = model(img, stream=True)
+    detections = []
+
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
+            w, h = x2 - x1, y2 - y1
+
+            # Confidence and class filtering
+            conf = box.conf[0]
+            cls = int(box.cls[0])
+            currentClass = "car" if cls == 2 else ""
+
+            # Filter to consider only "car" class
+            if currentClass == "car" and conf > 0.3:
+                detections.append(([x1, y1, w, h], conf, cls))
+
+    # Update DeepSORT tracker with detections
+    tracks = tracker.update_tracks(detections, frame=img)
+
+    for track in tracks:
+        if not track.is_confirmed():
+            continue
+
+        track_id = track.track_id
+
+        # Check if this track ID is already matched with an ID from video 1
+        if track_id in matched_ids_video2:
+            matched_id = matched_ids_video2[track_id]
+        else:
+            # Perform matching if no match has been recorded for this ID
+            embedding = np.array(track.features).reshape(-1)  # DeepSORT appearance embedding, reshaped
+            matched_id = None
+            highest_similarity = -1
+
+            for id1, embedding1 in embeddings_video1.items():
+                embedding1 = np.array(embedding1).reshape(-1)  # Convert and reshape to 1D if necessary
+
+                # Compute cosine similarity
+                similarity = np.dot(embedding, embedding1) / (np.linalg.norm(embedding) * np.linalg.norm(embedding1))
+                if similarity > 0.8 and similarity > highest_similarity:  # Threshold for similarity
+                    highest_similarity = similarity
+                    matched_id = id1
+
+            # Store the matched ID to keep it consistent across frames
+            if matched_id is not None:
+                matched_ids_video2[track_id] = matched_id
+
+        # Draw bounding box and ID for matched objects
+        ltrb = track.to_ltrb()
+        x1, y1, x2, y2 = map(int, ltrb)
+        w, h = x2 - x1, y2 - y1
+        if matched_id is not None:
+            cvzone.cornerRect(img, (x1, y1, w, h), l=9, rt=2, colorR=(0, 255, 0))
+            cvzone.putTextRect(img, f'Match ID {matched_id}', (max(0, x1), max(35, y1)), scale=0.7, thickness=1, offset=3)
+        else:
+            cvzone.cornerRect(img, (x1, y1, w, h), l=9, rt=2, colorR=(255, 0, 255))
+            cvzone.putTextRect(img, f'ID {track_id}', (max(0, x1), max(35, y1)), scale=0.7, thickness=1, offset=3)
+
+    out2.write(img)
+
+# Release resources
+cap1.release()
+cap2.release()
+out1.release()
+out2.release()
+cv2.destroyAllWindows()
+
+print(f"Output video 1 with tracking saved at {output_path1}")
+print(f"Output video 2 with tracking saved at {output_path2}")
+
+
+/////Using code to modify the Charts (REID and TOTAL OBJECTS IN FRAME)////
+
+!pip install matplotlib
+
+import numpy as np
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+import cv2
+import cvzone
+from deep_sort_realtime.deepsort_tracker import DeepSort
+
+# Initialize YOLO model
+model = YOLO("yolov10x.pt")
+
+# Define paths to video files
+source_video1 = "/content/VideoTrcking2.mp4"
+source_video2 = "/content/VideoTracking22.mp4"
+
+# Open the video files
+cap1 = cv2.VideoCapture(source_video1)
+cap2 = cv2.VideoCapture(source_video2)
+
+# Check if videos opened correctly
+if not cap1.isOpened() or not cap2.isOpened():
+    print("Error: Could not open one or both video files.")
+    cap1.release()
+    cap2.release()
+
+# Initialize DeepSORT tracker
+tracker = DeepSort(
+    max_age=60,
+    n_init=6,
+    max_iou_distance=0.2,
+    max_cosine_distance=0.25,
+    nn_budget=100
+)
+
+# Initialize data storage for charts
+frame_data_video1 = []  # Number of objects detected per frame in video 1
+frame_data_video2 = []  # Number of objects detected per frame in video 2
+iou_scores = []         # IoU scores for matching boxes
+reid_accuracies = []    # Re-identification accuracy per object
+matched_ids_video2 = {} # Store matched IDs between video1 and video2
+embeddings_video1 = {}  # Store embeddings and track IDs for video 1
+
+# IoU calculation function
+def calculate_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+
+    return intersection / union if union > 0 else 0
+
+# Process Video 1
+while True:
+    success, img = cap1.read()
+    if not success:
+        break
+
+    results = model(img, stream=True)
+    detections = []
+
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            w, h = x2 - x1, y2 - y1
+            conf = box.conf[0]
+            cls = int(box.cls[0])
+            current_class = "car" if cls == 2 else ""
+
+            if current_class == "car" and conf > 0.2:
+                detections.append(([x1, y1, w, h], conf, cls))
+
+    tracks = tracker.update_tracks(detections, frame=img)
+    frame_data_video1.append(len(tracks))
+
+    for track in tracks:
+        if track.is_confirmed():
+            embeddings_video1[track.track_id] = np.array(track.features).reshape(-1)
+
+# Process Video 2
+while True:
+    success, img = cap2.read()
+    if not success:
+        break
+
+    results = model(img, stream=True)
+    detections = []
+
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            w, h = x2 - x1, y2 - y1
+            conf = box.conf[0]
+            cls = int(box.cls[0])
+            current_class = "car" if cls == 2 else ""
+
+            if current_class == "car" and conf > 0.2:
+                detections.append(([x1, y1, w, h], conf, cls))
+
+    tracks = tracker.update_tracks(detections, frame=img)
+    frame_data_video2.append(len(tracks))
+
+    for track in tracks:
+        if track.is_confirmed():
+            track_id = track.track_id
+            embedding = np.array(track.features).reshape(-1)
+            matched_id = None
+            highest_similarity = -1
+
+            for id1, embedding1 in embeddings_video1.items():
+                similarity = np.dot(embedding, embedding1) / (np.linalg.norm(embedding) * np.linalg.norm(embedding1))
+                if similarity > 0.2 and similarity > highest_similarity:
+                    highest_similarity = similarity
+                    matched_id = id1
+
+            if matched_id:
+                matched_ids_video2[track_id] = matched_id
+                reid_accuracies.append(highest_similarity)
+
+# Release resources
+cap1.release()
+cap2.release()
+
+# Generate Charts
+# Detected objects per frame
+plt.figure(figsize=(10, 6))
+plt.plot(range(len(frame_data_video1)), frame_data_video1, label='Video 1', color='blue')
+plt.plot(range(len(frame_data_video2)), frame_data_video2, label='Video 2', color='red')
+plt.xlabel("Frame Number")
+plt.ylabel("Number of Objects Detected")
+plt.title("Number of Detected Objects Per Frame")
+plt.legend()
+plt.grid()
+plt.show()
+
+# IoU Distribution
+plt.figure(figsize=(10, 6))
+plt.hist(iou_scores, bins=10, color='green', alpha=0.7)
+plt.xlabel("IoU Score")
+plt.ylabel("Frequency")
+plt.title("IoU Score Distribution")
+plt.grid()
+plt.show()
+
+# ReIdentification Accuracy
+plt.figure(figsize=(10, 6))
+plt.bar(range(len(reid_accuracies)), reid_accuracies, color='purple', alpha=0.7)
+plt.xlabel("Object ID (Car)")
+plt.ylabel("Re-Identification Accuracy")
+plt.title("Re-Identification Accuracy")
+plt.ylim(0, 1)
+plt.grid()
+plt.show()
+
+
